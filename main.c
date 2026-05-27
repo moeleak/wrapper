@@ -610,6 +610,54 @@ static inline void writefull(const int connfd, void *const buf,
 
 static void *FHinstance = NULL;
 static void *preshareCtx = NULL;
+static pthread_mutex_t g_decrypt_ctx_state_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_decrypt_ctx_refresh_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_decrypt_ctx_refresh_requested = 0;
+static int g_decrypt_ctx_refresh_code = 0;
+
+inline static void *getKdContext(const char *const adam, const char *const uri);
+static int refresh_account_cache(struct shared_ptr reqCtx);
+
+void request_decrypt_ctx_refresh(int code) {
+    pthread_mutex_lock(&g_decrypt_ctx_state_lock);
+    g_decrypt_ctx_refresh_requested = 1;
+    g_decrypt_ctx_refresh_code = code;
+    pthread_mutex_unlock(&g_decrypt_ctx_state_lock);
+}
+
+static void refresh_decrypt_ctx_impl(const char *reason) {
+    uint8_t autom = 1;
+    fprintf(stderr, "[!] refreshing decrypt context: %s\n", reason);
+    refresh_account_cache(reqCtx);
+    _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
+    _ZN21SVFootHillSessionCtrl16resetAllContextsEv(FHinstance);
+    preshareCtx = NULL;
+    preshareCtx = getKdContext("0", "skd://itunes.apple.com/P000000000/s1/e1");
+    fprintf(stderr, "[!] refreshed decrypt context\n");
+}
+
+static void maybe_refresh_decrypt_ctx(void) {
+    int should_refresh = 0;
+    int refresh_code = 0;
+
+    pthread_mutex_lock(&g_decrypt_ctx_state_lock);
+    if (g_decrypt_ctx_refresh_requested) {
+        should_refresh = 1;
+        refresh_code = g_decrypt_ctx_refresh_code;
+        g_decrypt_ctx_refresh_requested = 0;
+        g_decrypt_ctx_refresh_code = 0;
+    }
+    pthread_mutex_unlock(&g_decrypt_ctx_state_lock);
+
+    if (should_refresh) {
+        char reason[64];
+        snprintf(reason, sizeof(reason), "lease/playback callback code %d",
+                 refresh_code);
+        pthread_mutex_lock(&g_decrypt_ctx_refresh_lock);
+        refresh_decrypt_ctx_impl(reason);
+        pthread_mutex_unlock(&g_decrypt_ctx_refresh_lock);
+    }
+}
 
 inline static void *getKdContext(const char *const adam,
                                  const char *const uri) {
@@ -652,16 +700,15 @@ inline static void *getKdContext(const char *const adam,
 }
 
 void refresh_decrypt_ctx() {
-    uint8_t autom = 1;
-    _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
-    _ZN21SVFootHillSessionCtrl16resetAllContextsEv(FHinstance);
-    preshareCtx = NULL;
-    preshareCtx = getKdContext("0", "skd://itunes.apple.com/P000000000/s1/e1");
-    fprintf(stderr, "[!] refreshed context\n");
+    pthread_mutex_lock(&g_decrypt_ctx_refresh_lock);
+    refresh_decrypt_ctx_impl("manual");
+    pthread_mutex_unlock(&g_decrypt_ctx_refresh_lock);
 }
 
 void handle(const int connfd) {
     while (1) {
+        maybe_refresh_decrypt_ctx();
+
         uint8_t adamSize;
         if (!readfull(connfd, &adamSize, sizeof(uint8_t)))
             return;
@@ -682,9 +729,13 @@ void handle(const int connfd) {
             return;
         uri[uri_size] = '\0';
 
-        void **const kdContext = getKdContext(adam, uri);
-        if (kdContext == NULL)
-            return;
+        void **kdContext = getKdContext(adam, uri);
+        if (kdContext == NULL) {
+            refresh_decrypt_ctx();
+            kdContext = getKdContext(adam, uri);
+            if (kdContext == NULL)
+                return;
+        }
 
         while (1) {
             uint32_t size;
@@ -756,10 +807,8 @@ inline static int new_socket() {
             return EXIT_FAILURE;
         }
 
-        if (!handle_cpp(connfd)) {
-            uint8_t autom = 1;
-            _ZN22SVPlaybackLeaseManager12requestLeaseERKb(leaseMgr, &autom);
-        }
+        if (!handle_cpp(connfd))
+            refresh_decrypt_ctx();
         // if (sigsetjmp(catcher.env, 0) == 0) {
         //     catcher.do_jump = 1;
         //     handle(connfd);
@@ -853,6 +902,8 @@ const char* get_m3u8_method_play(uint8_t leaseMgr[16], unsigned long adam) {
 void handle_m3u8(const int connfd) {
     while (1)
     {
+        maybe_refresh_decrypt_ctx();
+
         uint8_t adamSize;
         if (!readfull(connfd, &adamSize, sizeof(uint8_t))) {
             return;
@@ -871,6 +922,14 @@ void handle_m3u8(const int connfd) {
             m3u8 = get_m3u8_method_download(reqCtx, adamID);
         } else {
             m3u8 = get_m3u8_method_play(leaseMgr, adamID);
+        }
+        if (m3u8 == NULL) {
+            refresh_decrypt_ctx();
+            if (offlineFlag) {
+                m3u8 = get_m3u8_method_download(reqCtx, adamID);
+            } else {
+                m3u8 = get_m3u8_method_play(leaseMgr, adamID);
+            }
         }
         if (m3u8 == NULL) {
             fprintf(stderr, "[.] failed to get m3u8 of adamId: %ld\n", adamID);
